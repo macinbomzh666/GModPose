@@ -2184,14 +2184,29 @@ namespace GModPose::Runtime
             const auto root = worlds.Read(pose.bones[pose.tailJoints.front()].ref.Parent());
             if (!root) return true;
             const auto facing = AxisAngle({0, 0, 1}, pose.actor->GetAngleZ());
-            const auto bend = Rotate(facing, {0, -1, -.8}).value_or(Vec3{0, -1, -.8});
+            auto bend = Rotate(facing, {0, -1, -.8}).value_or(Vec3{0, -1, -.8});
+            std::optional<TailClearance> clearance;
+            if (const auto torso = ReadTorsoClearance(worlds)) {
+                clearance = TailClearance{*torso};
+                const auto up = Unit(torso->chest - torso->hips).value_or(Vec3{0, 0, 1});
+                const auto away = grip.joints[0].position - torso->hips;
+                if (const auto outward = Unit(away - up * Dot(away, up)))
+                    bend = *outward - up * .8;
+                for (std::size_t side = 0; side < clearance->thighs.size(); ++side) {
+                    const auto& leg = *pose.limbs[side + 2];
+                    const auto hip = worlds.Read(pose.bones[leg.joints[0]].ref);
+                    const auto knee = worlds.Read(pose.bones[leg.joints[1]].ref);
+                    if (hip && knee)
+                        clearance->thighs[side] = TailClearance::Thigh{hip->position, knee->position, torso->halfWidth * .4};
+                }
+            }
             std::optional<Vec3> tangent;
             if (turn) {
                 const auto neutralTipAxis = Rotate(Fingers::Conjugate(grip.parentOffsets[tip]), grip.linkAxes[tip - 1]);
                 if (neutralTipAxis) tangent = Rotate(*turn, *neutralTipAxis);
             }
             const auto solution = SolveTailEndpoint(grip.joints[0].position, std::span(grip.lengths).first(tip),
-                target, bend, nullptr, tangent);
+                target, bend, clearance ? &*clearance : nullptr, tangent);
             if (!solution) return true;
 
             // Parallel-transport the parent frame along the solved directions.

@@ -53,9 +53,11 @@ An ankle diamond has a short bar underneath when the foot is supported.
 During a torso drag, the bar shows which feet the grip keeps planted.
 
 Khajiit, Argonians, and custom races with compatible tails get tail diamonds.
-Drag the tip to move it through space. Drag a middle diamond to bend the tail
-while keeping the tip in place. The tail stays attached to the pelvis. Hold
-the rotate binding and scroll to twist a segment, or rotate the tip in place.
+Drag or rotate the tip to solve the whole tail in a smooth arc. The solver
+favors arcs that clear the torso and thighs. Rotating keeps the tip in place
+and guides the last segment. Drag a middle diamond to bend around the
+fixed tip, or hold the rotate binding and scroll to twist that segment.
+The tail stays attached to the pelvis.
 
 A visible drawn weapon has a rotation-only triangle. Right-drag or use the
 amber Nudge beam to rotate the weapon independently of the hand. Sheathed
