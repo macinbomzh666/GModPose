@@ -490,20 +490,28 @@ namespace GModPose::Runtime
             return touched;
         }
 
-        FacePose::Mask ApplyEditorFrame(const EditorFrame& frame)
+        enum class FrameSource { History, Preset };
+
+        FacePose::Mask ApplyEditorFrame(const EditorFrame& frame, FrameSource source)
         {
-            const auto write = [](RE::NiTransform& target, Transform value, float scale) {
+            const auto write = [source](RE::NiTransform& target, Transform value, float scale,
+                                        std::string_view bone, const char* space) {
                 target.translate = Native(value.position);
-                target.scale = scale;
                 WriteRotation(target, value.rotation);
+                // Presets can come from another actor with the same rig layout.
+                if (source == FrameSource::History) target.scale = scale;
+                else if (std::abs(target.scale - scale) > 1e-4F)
+                    SKSE::log::debug("Body preset {} scale on {}: saved {:.4f}, kept {:.4f}",
+                        space, bone, scale, target.scale);
             };
             if (!pose.seated) pose.translation = *Rotate(pose.historyOrigin.rotation, frame.translation);
             for (std::size_t i = 0; i < pose.bones.size(); ++i) {
                 auto& frozen = pose.bones[i];
                 if (frozen.seatAnchor) continue;
                 const auto& saved = frame.bones[i];
-                write(frozen.local, saved.local, saved.scale);
-                if (frozen.rootWorld) write(*frozen.rootWorld, *Compose(pose.historyOrigin, *saved.root), saved.rootScale);
+                write(frozen.local, saved.local, saved.scale, frozen.name, "local");
+                if (frozen.rootWorld)
+                    write(*frozen.rootWorld, *Compose(pose.historyOrigin, *saved.root), saved.rootScale, frozen.name, "root");
                 frozen.manualRotation = saved.manual;
             }
             std::size_t phase = 0;
@@ -626,7 +634,7 @@ namespace GModPose::Runtime
                     bodyPresetStatus = "That pose is unavailable.";
                     return false;
                 }
-                faceTouched |= ApplyEditorFrame(choice->pose);
+                faceTouched |= ApplyEditorFrame(choice->pose, FrameSource::Preset);
                 CommitHistory();
                 bodyPresetStatus = "Loaded " + choice->name + ".";
                 return true;
@@ -2628,7 +2636,7 @@ namespace GModPose::Runtime
                     for (const auto& command : input.actions) {
                         if (const auto* action = std::get_if<HistoryAction>(&command)) {
                             if (const auto* saved = editorHistory.Move(*action)) {
-                                faceTouched |= ApplyEditorFrame(*saved);
+                                faceTouched |= ApplyEditorFrame(*saved, FrameSource::History);
                                 restored = true;
                             }
                         } else if (editingBody) {
