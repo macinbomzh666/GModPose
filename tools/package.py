@@ -83,8 +83,13 @@ def package():
     fomod = {f"Common/{name}": payload for name, payload in files.items()}
     for folder, profile in (("Standalone", standalone), ("PlayerHub", regular)):
         fomod.update({f"{folder}/{name}": payload for name, payload in profile.items() if name not in files})
-    for name in ("ModuleConfig.xml", "playerhub.png", "standalone.png"):
-        fomod[f"fomod/{name}"] = (data / "fomod" / name).read_bytes()
+    installer = data / "fomod"
+    module_config = (installer / "ModuleConfig.xml").read_bytes()
+    if module_config.count(b"@VERSION@") != 1:
+        raise ValueError("Expected one version placeholder in the FOMOD module config")
+    fomod["fomod/ModuleConfig.xml"] = module_config.replace(b"@VERSION@", version.encode("ascii"))
+    for name in ("playerhub.png", "standalone.png"):
+        fomod[f"fomod/{name}"] = (installer / name).read_bytes()
     fomod["fomod/info.xml"] = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<fomod><Name>GModPose</Name><Author>Macinbomzh</Author>'
