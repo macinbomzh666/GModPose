@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+    <moduleName>GModPose</moduleName>
+    <requiredInstallFiles>
+        <folder source="Common" destination="" />
+    </requiredInstallFiles>
+    <installSteps order="Explicit">
+        <installStep name="Install GModPose">
+            <optionalFileGroups order="Explicit">
+                <group name="Posing profile" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="Standalone">
+                            <description>Use this if you don't use PlayerHub.</description>
+                            <image path="fomod/standalone.png" />
+                            <files>
+                                <folder source="Standalone" destination="" />
+                            </files>
+                            <typeDescriptor><type name="Optional" /></typeDescriptor>
+                        </plugin>
+                        <plugin name="PlayerHub">
+                            <description>Use this if you use PlayerHub. Includes workarounds designed to work with PlayerHub.&#10;&#10;Requires Pandora 5.</description>
+                            <image path="fomod/playerhub.png" />
+                            <files>
+                                <folder source="PlayerHub" destination="" />
+                            </files>
+                            <typeDescriptor><type name="Optional" /></typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+</config>

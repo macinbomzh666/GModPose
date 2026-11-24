@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.ttf binary
+
+*.hkx binary
+*.dll binary
+*.bin binary

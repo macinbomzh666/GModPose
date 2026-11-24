@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pose schema",
+  "oneOf": [
+    {
+      "$ref": "face-pose.schema.json"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "type": {
+          "const": "hand"
+        },
+        "name": {
+          "$ref": "face-pose.schema.json#/$defs/label"
+        },
+        "category": {
+          "enum": [
+            "custom",
+            "premade"
+          ],
+          "default": "custom"
+        },
+        "source": {
+          "$ref": "face-pose.schema.json#/$defs/label"
+        },
+        "pose": {
+          "type": "object",
+          "properties": {
+            "fingers": {
+              "type": "object",
+              "properties": {
+                "thumb": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/rotation"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "index": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/rotation"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "middle": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/rotation"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "ring": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/rotation"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "little": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/rotation"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                }
+              },
+              "required": [
+                "thumb",
+                "index",
+                "middle",
+                "ring",
+                "little"
+              ]
+            }
+          },
+          "required": [
+            "fingers"
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "type",
+        "name",
+        "pose"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "type": {
+          "const": "body"
+        },
+        "name": {
+          "$ref": "face-pose.schema.json#/$defs/label"
+        },
+        "category": {
+          "enum": [
+            "custom",
+            "premade"
+          ],
+          "default": "custom"
+        },
+        "source": {
+          "$ref": "face-pose.schema.json#/$defs/label"
+        },
+        "pose": {
+          "type": "object",
+          "properties": {
+            "rig": {
+              "type": "string",
+              "pattern": "^[0-9]+$"
+            },
+            "translation": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": -10000000,
+                "maximum": 10000000
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "bones": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "local": {
+                    "$ref": "#/$defs/transform"
+                  },
+                  "manual": {
+                    "type": "boolean"
+                  },
+                  "root": {
+                    "$ref": "#/$defs/transform"
+                  }
+                },
+                "required": [
+                  "local",
+                  "manual"
+                ]
+              }
+            },
+            "twist_phases": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": -10000000,
+                "maximum": 10000000
+              },
+              "minItems": 16,
+              "maxItems": 16
+            },
+            "face": {
+              "type": "object",
+              "properties": {
+                "supported": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "pose": {
+                  "$ref": "face-pose.schema.json#/properties/pose"
+                },
+                "expressions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "face-pose.schema.json#/$defs/weight"
+                  },
+                  "minItems": 17,
+                  "maxItems": 17
+                }
+              },
+              "required": [
+                "supported",
+                "pose",
+                "expressions"
+              ]
+            }
+          },
+          "required": [
+            "rig",
+            "translation",
+            "bones",
+            "twist_phases"
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "type",
+        "name",
+        "pose"
+      ]
+    }
+  ],
+  "$defs": {
+    "rotation": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "minimum": -10000000,
+        "maximum": 10000000
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "transform": {
+      "type": "object",
+      "properties": {
+        "position": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -10000000,
+            "maximum": 10000000
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "rotation": {
+          "$ref": "#/$defs/rotation"
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "position",
+        "rotation",
+        "scale"
+      ]
+    }
+  }
+}

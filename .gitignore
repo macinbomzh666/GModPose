@@ -1,0 +1,6 @@
+/build/
+/dist/
+/tools/pandora/bin/
+/tools/pandora/obj/
+__pycache__/
+*.pyc

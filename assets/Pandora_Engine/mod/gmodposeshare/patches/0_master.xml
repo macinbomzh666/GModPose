@@ -1,0 +1,30 @@
+<?xml version='1.0' encoding='utf-8'?>
+<patch>
+  <Append path="#0106/eventNames">
+    <hkcstring>GModPoseShareStart</hkcstring>
+  </Append>
+  <Append path="#0108/eventInfos">
+    <hkobject>
+      <hkparam name="flags">0</hkparam>
+    </hkobject>
+  </Append>
+  <Append path="#0106/variableNames">
+    <hkcstring>GModPoseShareRevision</hkcstring>
+  </Append>
+  <Append path="#0107/wordVariableValues">
+    <hkobject>
+      <hkparam name="value">1</hkparam>
+    </hkobject>
+  </Append>
+  <Append path="#0108/variableInfos">
+    <hkobject>
+      <hkparam name="role">
+        <hkobject>
+          <hkparam name="role">ROLE_DEFAULT</hkparam>
+          <hkparam name="flags">0</hkparam>
+        </hkobject>
+      </hkparam>
+      <hkparam name="type">VARIABLE_TYPE_INT32</hkparam>
+    </hkobject>
+  </Append>
+</patch>

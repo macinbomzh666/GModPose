@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Pandora.API" HintPath="$(PandoraDirectory)/Pandora.API.dll" Private="false" />
+    <Reference Include="HKX2E" HintPath="$(PandoraDirectory)/HKX2E.dll" Private="false" />
+  </ItemGroup>
+</Project>
