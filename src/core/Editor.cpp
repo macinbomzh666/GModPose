@@ -19,7 +19,7 @@
 #include "Breathing.h"
 #include "GrabButton.h"
 #include "SeatBlock.h"
-#include "TailPose.h"
+#include "TailEndpoint.h"
 
 #include <atomic>
 #include <bit>
@@ -395,6 +395,8 @@ namespace GModPose::Runtime
                 {
                     std::array<Transform, tailJointCount> joints;
                     std::array<Quaternion, tailJointCount> parentOffsets;
+                    std::array<Vec3, tailJointCount - 1> linkAxes;
+                    std::array<double, tailJointCount - 1> lengths;
                     std::size_t held;
                 };
                 std::optional<Tail> tail{};
@@ -2098,6 +2100,17 @@ namespace GModPose::Runtime
                     }
                     if (joint == handle.bone) tail.held = i;
                 }
+                if (tail.held + 1 == pose.tailJoints.size()) {
+                    // Removing the joint rotation leaves the rig's offset,
+                    // including any unchanged helper nodes between controls.
+                    for (std::size_t i = 0; i < tail.held; ++i) {
+                        const auto offset = tail.joints[i + 1].position - tail.joints[i].position;
+                        tail.lengths[i] = Length(offset);
+                        const auto axis = Unit(offset);
+                        if (!axis) return;
+                        tail.linkAxes[i] = *Rotate(Fingers::Conjugate(tail.joints[i].rotation), *axis);
+                    }
+                }
                 grip.tail = tail;
             } else if (handle.action == HandleAction::Bend || handle.action == HandleAction::Endpoint) {
                 const auto& limb = *pose.limbs[handle.limb];
@@ -2164,21 +2177,56 @@ namespace GModPose::Runtime
             return true;
         }
 
+        bool ApplyTailEndpoint(const Interaction::Grip::Tail& grip, Vec3 target, std::optional<Quaternion> turn)
+        {
+            const auto tip = grip.held;
+            WorldPose worlds;
+            const auto root = worlds.Read(pose.bones[pose.tailJoints.front()].ref.Parent());
+            if (!root) return true;
+            const auto facing = AxisAngle({0, 0, 1}, pose.actor->GetAngleZ());
+            const auto bend = Rotate(facing, {0, -1, -.8}).value_or(Vec3{0, -1, -.8});
+            std::optional<Vec3> tangent;
+            if (turn) {
+                const auto neutralTipAxis = Rotate(Fingers::Conjugate(grip.parentOffsets[tip]), grip.linkAxes[tip - 1]);
+                if (neutralTipAxis) tangent = Rotate(*turn, *neutralTipAxis);
+            }
+            const auto solution = SolveTailEndpoint(grip.joints[0].position, std::span(grip.lengths).first(tip),
+                target, bend, nullptr, tangent);
+            if (!solution) return true;
+
+            // Parallel-transport the parent frame along the solved directions.
+            // None of the previously posed tail rotations are used as a seed.
+            auto previous = root->rotation;
+            std::array<Quaternion, tailJointCount> locals{};
+            for (std::size_t i = 0; i < tip; ++i) {
+                const auto parent = Multiply(previous, grip.parentOffsets[i]);
+                const auto neutralAxis = Rotate(parent, grip.linkAxes[i]);
+                const auto link = solution->joints[i + 1] - solution->joints[i];
+                const auto swing = neutralAxis ? FromTo(*neutralAxis, link) : std::nullopt;
+                if (!swing) return true;
+                const auto world = Multiply(*swing, parent);
+                locals[i] = TailLocalRotation(world, previous, grip.parentOffsets[i]);
+                previous = world;
+            }
+            if (turn) locals[tip] = TailLocalRotation(*turn, previous, grip.parentOffsets[tip]);
+            for (std::size_t i = 0; i <= tip; ++i)
+                WriteRotation(pose.bones[pose.tailJoints[i]].local, locals[i]);
+            return solution->limited;
+        }
+
         bool ApplyTailGrip(const Interaction::Grip::Tail& grip, Vec3 delta, std::optional<Quaternion> turn)
         {
             const auto tip = pose.tailJoints.size() - 1;
+            if (grip.held == tip) return ApplyTailEndpoint(grip, grip.joints[tip].position + delta, turn);
             std::array<Quaternion, tailJointCount> world{};
             for (std::size_t i = 0; i <= tip; ++i) world[i] = grip.joints[i].rotation;
             bool limited = false;
             if (turn) {
-                if (grip.held == tip) world[tip] = *turn;
-                else {
-                    const auto axis = Unit(grip.joints[grip.held + 1].position - grip.joints[grip.held].position);
-                    if (!axis) return true;
-                    // Roll around the outgoing link. Keeping all other world
-                    // frames fixed cancels the roll at the next joint.
-                    world[grip.held] = TailTwist(world[grip.held], *turn, *axis);
-                }
+                const auto axis = Unit(grip.joints[grip.held + 1].position - grip.joints[grip.held].position);
+                if (!axis) return true;
+                // Roll around the outgoing link. Keeping all other world
+                // frames fixed cancels the roll at the next joint.
+                world[grip.held] = TailTwist(world[grip.held], *turn, *axis);
             } else {
                 if (!grip.held && tip == 1) return true;
                 std::array<Vec3, tailJointCount> positions{};
@@ -2200,9 +2248,6 @@ namespace GModPose::Runtime
             if (!parent) return true;
             auto previous = parent->rotation;
             for (std::size_t i = 0; i <= tip; ++i) {
-                // A tip drag preserves its authored bend relative to the preceding bone.
-                // Middle edits instead hold the tip's world orientation.
-                if (i == tip && !turn && grip.held == tip) break;
                 auto& bone = pose.bones[pose.tailJoints[i]];
                 WriteRotation(bone.local, TailLocalRotation(world[i], previous, grip.parentOffsets[i]));
                 previous = world[i];
