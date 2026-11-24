@@ -7,6 +7,7 @@
 #include "../src/core/PoseHistory.h"
 #include "../src/core/DragView.h"
 #include "../src/core/TailPose.h"
+#include "../src/core/TailEndpoint.h"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +81,49 @@ namespace
         Check(Near(*Rotate(tipWorld, {1, 0, 0}), *Rotate(reconstructed, {1, 0, 0})) &&
             Near(*Rotate(tipWorld, {0, 1, 0}), *Rotate(reconstructed, {0, 1, 0})),
             "tail rotation is written in the helper's parent frame");
+    }
+
+    void TailEndpointArcs()
+    {
+        const std::array links{1., 1., 1., 1.};
+        const Vec3 root{-1.5, 0, 0}, goal{1.5, 0, 0}, bend{0, 1, 0};
+        const auto verify = [&](const std::optional<TailMove>& result, Vec3 end, std::span<const double> lengths) {
+            if (!result || !Near(result->joints[0], root) || !Near(result->joints[lengths.size()], end)) return false;
+            for (std::size_t i = 0; i < lengths.size(); ++i)
+                if (!Near(Length(result->joints[i + 1] - result->joints[i]), lengths[i])) return false;
+            return true;
+        };
+        const auto arc = SolveTailEndpoint(root, links, goal, bend);
+        Check(verify(arc, goal, links), "tail arc fits the target and fixed rig lengths");
+        const auto direction = [](const TailMove& move, std::size_t i) {
+            return *Unit(move.joints[i + 1] - move.joints[i]);
+        };
+        const auto bendAngle = [&](std::size_t i) { return Dot(direction(*arc, i - 1), direction(*arc, i)); };
+        Check(Near(bendAngle(1), bendAngle(2), 1e-5) && Near(bendAngle(2), bendAngle(3), 1e-5),
+            "equal tail links bend by equal amounts");
+
+        // Place the body over the preferred arc and leave other planes clear.
+        const TailClearance body{{{0, .95, -1}, {0, .95, 1}, {1, 0, 0}, {0, 1, 0}, .45, .45}};
+        const auto clear = SolveTailEndpoint(root, links, goal, bend, &body);
+        Check(verify(clear, goal, links) && body.Overlap(arc->joints) > .1 && body.Overlap(clear->joints) < .001,
+            "the solver finds a clear arc without shifting a reachable tip");
+
+        const Vec3 tangent{1, .8, 0};
+        const auto turned = SolveTailEndpoint(root, links, goal, bend, nullptr, tangent);
+        Check(verify(turned, goal, links) &&
+            Dot(direction(*turned, 3), *Unit(tangent)) > Dot(direction(*arc, 3), *Unit(tangent)),
+            "turning the tip changes the approach direction and keeps its position pinned");
+
+        const auto full = SolveTailEndpoint(root, links, {10, 0, 0}, bend);
+        Check(verify(full, {2.5, 0, 0}, links) && full->limited, "tail endpoint clamps at full reach");
+        Check(verify(SolveTailEndpoint(root, links, root, bend), root, links), "tail endpoint folds to the base");
+        const std::array uneven{1.3, .85, .6, .4};
+        Check(verify(SolveTailEndpoint(root, uneven, {-.8, .1, 0}, bend), {-.8, .1, 0}, uneven),
+            "a short arc with uneven links still satisfies its length constraints");
+        const auto repeated = SolveTailEndpoint(root, links, goal, bend, &body);
+        Check(verify(repeated, goal, links) &&
+            std::ranges::equal(clear->joints, repeated->joints, [](Vec3 a, Vec3 b) { return Near(a, b); }),
+            "tail endpoint solve is independent of intervening edits");
     }
     TwoBoneInput Arm()
     {
@@ -1624,6 +1668,7 @@ namespace
 int main()
 {
     TailInverseKinematics();
+    TailEndpointArcs();
     RotationAndSpace(); InverseKinematics(); NaturalLimbBends(); PlantedWristBend(); LimbCollisionClearance(); CoordinatedArmDrag(); AbsoluteWristSolve(); LearnedAnkleAndChestStance();
     ClavicleRecovery(); EndpointRotationIK(); WristTwist();
     HierarchyReconstruction(); TwistHierarchyReconstruction();
