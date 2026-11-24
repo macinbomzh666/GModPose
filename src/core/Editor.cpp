@@ -100,6 +100,9 @@ namespace GModPose::Runtime
         constexpr std::string_view kEye = "NPCEyeBone";
         constexpr std::array<std::string_view, 2> kClavicles{"NPC L Clavicle [LClv]", "NPC R Clavicle [RClv]"};
         constexpr std::array<std::string_view, 2> kToes{"NPC L Toe0 [LToe]", "NPC R Toe0 [RToe]"};
+        constexpr std::array<std::string_view, 5> kTail{"TailBone01", "TailBone02", "TailBone03", "TailBone04", "TailBone05"};
+        constexpr std::array kTailLabels{"Tail base", "Tail 2", "Tail 3", "Tail 4", "Tail tip"};
+        constexpr auto kSceneBoneIndex = std::numeric_limits<std::uint32_t>::max();
         struct ExtraHandle
         {
             std::string_view bone, markerGuide;
@@ -136,6 +139,7 @@ namespace GModPose::Runtime
             std::string_view name;
             bool carriesTranslation{}, aboveCom{}, manualRotation{}, seatAnchor{};
             std::optional<RE::NiTransform> seatParent;
+            BoneRef tailSlot{};
             struct RigReference { Transform local, world; };
             std::optional<RigReference> reference{};
         };
@@ -247,6 +251,7 @@ namespace GModPose::Runtime
         std::vector<BodyPreset> bodyPresets;
         std::filesystem::path bodyPresetsFile;
         std::string bodyPresetRig;
+        std::string previousBodyPresetRig;
         std::string bodyPresetStatus;
         constexpr std::size_t maxBodyPresets = 128;
         constexpr std::string_view bodyPresetHeader = "GModPose body preset 1 ";
@@ -260,6 +265,9 @@ namespace GModPose::Runtime
             const RE::NiAVObject* root{};
             std::uint32_t count{};
             std::vector<FrozenBone> bones;
+            std::size_t graphBoneCount{};
+            RE::NiPointer<RE::BSFlattenedBoneTree> tailTree;
+            std::array<RE::NiPointer<RE::NiAVObject>, kTail.size()> sceneTail;
             std::unordered_map<const RE::NiTransform*, std::size_t> byWorld;
             std::array<std::optional<Limb>, kLimbs.size()> limbs;
             std::array<Hand, 2> hands;
@@ -325,6 +333,7 @@ namespace GModPose::Runtime
         std::mutex poseMutex, inputMutex;
         std::atomic_bool active{false}, ready{false}, loading{false};
         std::atomic_bool rotationHeld{false}, settingsOpen{false}, fingerOpen{false}, faceOpen{false}, bodyOpen{false};
+        std::atomic<RE::BSFlattenedBoneTree*> activeTailTree{};
         std::atomic_uint commands{}, threadID{};
         std::atomic<RE::ControlMap*> textInputOwner{nullptr};
         std::atomic_uint64_t generation{};
@@ -505,7 +514,7 @@ namespace GModPose::Runtime
                         space, bone, scale, target.scale);
             };
             if (!pose.seated) pose.translation = *Rotate(pose.historyOrigin.rotation, frame.translation);
-            for (std::size_t i = 0; i < pose.bones.size(); ++i) {
+            for (std::size_t i = 0; i < std::min(pose.bones.size(), frame.bones.size()); ++i) {
                 auto& frozen = pose.bones[i];
                 if (frozen.seatAnchor) continue;
                 const auto& saved = frame.bones[i];
@@ -565,7 +574,7 @@ namespace GModPose::Runtime
             }
         }
 
-        bool DecodeEditorFrame(std::istream& in, EditorFrame& frame)
+        bool DecodeEditorFrame(std::istream& in, EditorFrame& frame, std::size_t boneCount)
         {
             const auto number = [&](double& value) { return (in >> value) && std::abs(value) <= 1e7; };
             const auto point = [&](Vec3& value) { return number(value.x) && number(value.y) && number(value.z); };
@@ -574,7 +583,7 @@ namespace GModPose::Runtime
                     (in >> scale) && scale > 0 && scale <= 100;
             };
             if (!point(frame.translation)) return false;
-            frame.bones.resize(pose.bones.size());
+            frame.bones.resize(boneCount);
             for (std::size_t i = 0; i < frame.bones.size(); ++i) {
                 auto& bone = frame.bones[i];
                 if (!read(bone.local, bone.scale) || !(in >> bone.manual)) return false;
@@ -609,13 +618,27 @@ namespace GModPose::Runtime
         {
             bodyPresets = PoseSerialization::ReadFolder<BodyPreset>(bodyPresetsFile, "body", maxBodyPresets,
                 [](const auto& object, BodyPreset& item) {
-                    return PoseSerialization::DecodeBody(object, item.pose, bodyPresetRig, pose.bones.size(),
-                        [](std::size_t index) { return pose.bones[index].rootWorld.has_value(); });
+                    const auto rooted = [](std::size_t index) { return pose.bones[index].rootWorld.has_value(); };
+                    if (!previousBodyPresetRig.empty() && PosePresetJson::StringIs(
+                            PosePresetJson::Field(object, "rig"), previousBodyPresetRig))
+                        return PoseSerialization::DecodeBody(object, item.pose, previousBodyPresetRig, pose.graphBoneCount, rooted);
+                    return PoseSerialization::DecodeBody(object, item.pose, bodyPresetRig, pose.bones.size(), rooted);
                 });
             auto legacy = PresetStorage::ReadLegacyFolder<BodyPreset>(bodyPresetsFile,
                 std::string(bodyPresetHeader) + bodyPresetRig, maxBodyPresets,
-                [](std::istream& in, BodyPreset& item) { return DecodeEditorFrame(in, item.pose); });
+                [](std::istream& in, BodyPreset& item) { return DecodeEditorFrame(in, item.pose, pose.bones.size()); });
             PresetStorage::MigrateFiles(bodyPresetsFile, bodyPresets, std::move(legacy), maxBodyPresets, StoreBodyPreset);
+            if (!previousBodyPresetRig.empty()) {
+                auto graphPresets = PresetStorage::ReadLegacyFolder<BodyPreset>(bodyPresetsFile,
+                    std::string(bodyPresetHeader) + previousBodyPresetRig, maxBodyPresets,
+                    [](std::istream& in, BodyPreset& item) { return DecodeEditorFrame(in, item.pose, pose.graphBoneCount); });
+                // Old body presets leave the newly captured tail joints at their current pose.
+                for (auto& item : graphPresets) {
+                    if (bodyPresets.size() == maxBodyPresets) break;
+                    if (PresetStorage::FindName(bodyPresets, item.name) == bodyPresets.end())
+                        bodyPresets.push_back(std::move(item));
+                }
+            }
             SortBodyPresets();
             bodyPresetStatus.clear();
         }
@@ -687,7 +710,10 @@ namespace GModPose::Runtime
             std::uint64_t rig = 14695981039346656037ULL;
             const auto hash = [&](std::uint64_t value) { rig = (rig ^ value) * 1099511628211ULL; };
             hash(pose.count);
-            for (const auto& bone : pose.bones) {
+            std::optional<std::uint64_t> previousRig;
+            for (std::size_t i = 0; i < pose.bones.size(); ++i) {
+                if (i == pose.graphBoneCount) previousRig = rig;
+                const auto& bone = pose.bones[i];
                 hash(bone.index);
                 hash(bone.rootWorld.has_value());
                 for (const unsigned char letter : bone.name) hash(letter);
@@ -697,16 +723,29 @@ namespace GModPose::Runtime
                     for (const auto value : offset) hash(std::bit_cast<std::uint32_t>(value));
                 }
             }
-            const auto path = std::filesystem::path(REL::Module::get().filePath().data()).parent_path() /
-                (L"Data/SKSE/Plugins/GModPose-history-" + std::to_wstring(rig) + L".txt");
+            const auto historyPath = [](std::uint64_t key) {
+                return std::filesystem::path(REL::Module::get().filePath().data()).parent_path() /
+                    (L"Data/SKSE/Plugins/GModPose-history-" + std::to_wstring(key) + L".txt");
+            };
+            const auto path = historyPath(rig);
+            auto frame = ReadEditorFrame();
             if (path != editorHistoryFile) {
                 editorHistoryFile = path;
                 editorHistory = {};
-                HistoryStorage::Load(path, "editor", editorHistory, DecodeEditorFrame);
+                const auto read = [](std::istream& in, EditorFrame& state) { return DecodeEditorFrame(in, state, pose.bones.size()); };
+                if (!HistoryStorage::Load(path, "editor", editorHistory, read) && previousRig && frame) {
+                    // Existing checkpoints predate the tail capture. Use its entry pose for those joints.
+                    HistoryStorage::Load(historyPath(*previousRig), "editor", editorHistory, [&](std::istream& in, EditorFrame& state) {
+                        if (!DecodeEditorFrame(in, state, pose.graphBoneCount)) return false;
+                        state.bones.insert(state.bones.end(), frame->bones.begin() + pose.graphBoneCount, frame->bones.end());
+                        return true;
+                    });
+                }
                 bodyPresetsFile = PresetStorage::Folder(path.parent_path(), L"Body");
                 bodyPresetRig = std::to_string(rig);
+                previousBodyPresetRig = previousRig ? std::to_string(*previousRig) : std::string{};
             }
-            if (auto frame = ReadEditorFrame()) {
+            if (frame) {
                 editorHistory.Commit(std::move(*frame));
                 pose.historyReady = true;
             }
@@ -800,6 +839,28 @@ namespace GModPose::Runtime
                 Skeleton(graph) == capture.skeleton && graph.boneNodes.size() == capture.count;
         }
 
+        template <std::size_t Slot> struct TailUpdateHook
+        {
+            static void Thunk(RE::BSFlattenedBoneTree* tree, RE::NiUpdateData& data, std::uint32_t flags)
+            {
+                if (Running() && tree == activeTailTree.load(std::memory_order_acquire)) {
+                    const std::scoped_lock lock(poseMutex);
+                    if (Running() && tree == pose.tailTree.get()) {
+                        // The scene tree can update tail joints outside the body's Havok pose copy.
+                        // Hold both forms of the local transform before Skyrim builds skin matrices.
+                        for (const auto& bone : std::span(pose.bones).subspan(pose.graphBoneCount)) {
+                            if (const auto* slot = bone.tailSlot.Slot()) {
+                                *bone.tailSlot.Local() = bone.local;
+                                if (slot->node) slot->node->local = bone.local;
+                            }
+                        }
+                    }
+                }
+                original(tree, data, flags);
+            }
+            static inline HookOriginal<decltype(Thunk)> original;
+        };
+
         std::optional<RE::NiTransform> LiveParentFrame(BoneRef bone, unsigned depth = 0)
         {
             const auto* world = bone.World();
@@ -824,7 +885,7 @@ namespace GModPose::Runtime
             WorldPose frozenWorlds;
             for (const auto& frozen : pose.bones) {
                 if (pose.rebaseForSharing && frozen.aboveCom) continue;
-                const auto ref = GraphBoneRef(graph.boneNodes[frozen.index]);
+                const auto ref = frozen.index == kSceneBoneIndex ? frozen.ref : GraphBoneRef(graph.boneNodes[frozen.index]);
                 const auto parent = ref.Parent();
                 const BoneTransforms bone{ref.Local(), ref.World(), parent.World()};
                 if (!bone.local) continue;
@@ -1268,6 +1329,103 @@ namespace GModPose::Runtime
             }
         }
 
+        void AddTailHandles(Capture& next, RE::NiAVObject& root)
+        {
+            const auto& biped = next.actor->GetBiped(false);
+            const auto* tail = biped ? &biped->objects[RE::BIPED_OBJECTS::kTail] : nullptr;
+            const bool equippedTail = tail && tail->partClone && !tail->partClone->GetAppCulled();
+
+            // TailProject animates a separate chain on the same scene skeleton as the pelvis.
+            // Use the captured pelvis to identify that tree among attached skeletal objects.
+            const auto pelvis = std::ranges::find(next.bones, kCenter[1], &FrozenBone::name);
+            const auto findSlot = [](RE::BSFlattenedBoneTree& tree, const RE::BSFixedString& name) {
+                const auto& map = tree.GetRuntimeData().boneMap;
+                const auto found = map.find(name);
+                if (found == map.end() || found->second < 0) return BoneRef{};
+                const BoneRef slot{&tree, found->second};
+                return slot.Slot() ? slot : BoneRef{};
+            };
+            using Visit = RE::BSVisit::BSVisitControl;
+            RE::BSFlattenedBoneTree* skeleton = nullptr;
+            if (pelvis != next.bones.end()) {
+                const RE::BSFixedString pelvisName{kCenter[1].data()};
+                RE::BSVisit::TraverseScenegraphObjects(&root, [&](RE::NiAVObject* object) {
+                    auto* tree = netimmerse_cast<RE::BSFlattenedBoneTree*>(object);
+                    if (!tree) return Visit::kContinue;
+                    const auto slot = findSlot(*tree, pelvisName);
+                    if (slot != pelvis->ref && slot.Resolve() != pelvis->ref) return Visit::kContinue;
+                    skeleton = tree;
+                    return Visit::kStop;
+                });
+            }
+            if (!skeleton) {
+                if (equippedTail) SKSE::log::warn("Tail posing: could not identify the player scene skeleton by its pelvis");
+                return;
+            }
+
+            std::array<BoneRef, kTail.size()> slots{};
+            for (std::size_t i = 0; i < kTail.size(); ++i)
+                slots[i] = findSlot(*skeleton, RE::BSFixedString{kTail[i].data()});
+            if (std::ranges::none_of(slots, [](BoneRef slot) { return slot.node; })) {
+                if (equippedTail) SKSE::log::warn("Tail posing: no TailBone slots on the player scene skeleton");
+                return;
+            }
+
+            // Universal rigs expose tail slots even on tailless races. A custom tail
+            // can be skinned into the body mesh without using the biped tail slot.
+            const auto checkSkin = [&](RE::BSGeometry* geometry) {
+                const auto& skin = geometry->GetGeometryRuntimeData().skinInstance;
+                if (geometry->GetAppCulled() || !skin || !skin->skinData) return Visit::kContinue;
+                const auto count = skin->skinData->GetBoneCount();
+                if (count > 4096) return Visit::kContinue;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto* bone = skin->bones ? skin->bones[i] : nullptr;
+                    const auto* world = skin->boneWorldTransforms ? skin->boneWorldTransforms[i] : nullptr;
+                    if (std::ranges::any_of(slots, [&](BoneRef slot) {
+                        if (const auto* entry = slot.Slot())
+                            return (bone && bone == entry->node) ||
+                                (world && (world == &entry->world || world == slot.Resolve().World()));
+                        return false;
+                    })) return Visit::kStop;
+                }
+                return Visit::kContinue;
+            };
+            if (!equippedTail && RE::BSVisit::TraverseScenegraphGeometries(&root, checkSkin) != Visit::kStop)
+                return;
+
+            std::array<std::optional<std::size_t>, kTail.size()> joints{};
+            for (std::size_t i = 0; i < joints.size(); ++i) {
+                const auto ref = slots[i].Resolve();
+                if (!ReadTransform(ref.Local()) || !ReadTransform(ref.World())) continue;
+                const auto [existing, inserted] = next.byWorld.try_emplace(ref.World(), next.bones.size());
+                joints[i] = existing->second;
+                if (!inserted) continue;
+                next.sceneTail[i].reset(ref.node);
+                next.bones.push_back({kSceneBoneIndex, ref, *ref.Local(), {}, kTail[i]});
+                next.bones.back().tailSlot = slots[i];
+            }
+            if (next.bones.size() > next.graphBoneCount) next.tailTree.reset(skeleton);
+            SKSE::log::info("Tail posing: {} scene skeleton joints, equipped tail={}",
+                std::ranges::count_if(joints, [](auto joint) { return joint.has_value(); }), equippedTail);
+
+            const auto jointFrame = [&](std::size_t index) {
+                return joints[index] ? ReadTransform(next.bones[*joints[index]].ref.World()) : std::nullopt;
+            };
+            for (std::size_t i = 0; i < joints.size(); ++i) {
+                const auto frame = jointFrame(i);
+                if (!frame) continue;
+                const auto farther = i + 1 < joints.size() ? jointFrame(i + 1) : std::nullopt;
+                const auto nearer = !farther && i > 0 ? jointFrame(i - 1) : std::nullopt;
+                const Vec3 direction = farther ? farther->position - frame->position :
+                    nearer ? frame->position - nearer->position : Vec3{};
+                const auto lever = Length(direction) > .001 ?
+                    Rotate(Fingers::Conjugate(frame->rotation), direction * .5).value_or(Vec3{0, -4, 0}) :
+                    Vec3{0, -4, 0};
+                next.handles.push_back({*joints[i], HandleAction::Rotate,
+                    kTailLabels[i], 0, false, lever});
+            }
+        }
+
         void CaptureReferenceControls(Capture& next)
         {
             if (!next.skeleton) return;
@@ -1408,6 +1566,7 @@ namespace GModPose::Runtime
             std::lock_guard lock(poseMutex);
             if (loading.load() || generation.load() != stamp) return false;
             pose = std::move(next);
+            activeTailTree.store(pose.tailTree.get(), std::memory_order_release);
             active.store(true, std::memory_order_release);
             SKSE::log::info("Captured {} bones, {} body handles and {} IK chains", pose.bones.size(),
                 pose.handles.size(), std::ranges::count_if(pose.limbs, [](const auto& limb) { return limb.has_value(); }));
@@ -1474,6 +1633,7 @@ namespace GModPose::Runtime
                     next.bones.push_back({i, bone, *bone.Local(), {}, name});
                 }
                 if (next.bones.empty()) return false;
+                next.graphBoneCount = next.bones.size();
                 for (auto& frozen : next.bones) {
                     auto parent = frozen.ref.Parent();
                     if (!ReadTransform(frozen.ref.World())) continue;
@@ -1563,6 +1723,7 @@ namespace GModPose::Runtime
                 }
                 AddTwistHandles(next);
                 AddWeaponHandles(next, player);
+                AddTailHandles(next, *graph.rootNode);
                 CaptureLimbGeometry(next, player.GetAngleZ());
                 MapFingers(next);
                 CaptureReferenceControls(next);
@@ -2544,7 +2705,9 @@ namespace GModPose::Runtime
                     }
                     captured = WithGraph(*player, [&](const RE::BShkbAnimationGraph& graph) {
                         if (!SameGraph(graph, wait->capture) || !std::ranges::all_of(wait->capture.bones,
-                            [&](const FrozenBone& bone) { return GraphBoneRef(graph.boneNodes[bone.index]) == bone.ref; }))
+                            [&](const FrozenBone& bone) {
+                                return bone.index == kSceneBoneIndex || GraphBoneRef(graph.boneNodes[bone.index]) == bone.ref;
+                            }))
                             return false;
                         return PublishCapture(std::move(wait->capture), wait->generation);
                     });
@@ -3298,8 +3461,12 @@ namespace GModPose::Runtime
         FacePanel::Load();
         REL::Relocation<std::uintptr_t> mouse{RE::VTABLE_BSWin32MouseDevice[0]};
         REL::Relocation<std::uintptr_t> keyboard{RE::VTABLE_BSWin32KeyboardDevice[0]};
+        REL::Relocation<std::uintptr_t> tree{RE::VTABLE_BSFlattenedBoneTree[0]};
         if (!MousePoll::original.InstallVirtual(mouse, 2, MousePoll::Thunk) ||
-            !KeyboardPoll::original.InstallVirtual(keyboard, 2, KeyboardPoll::Thunk)) return false;
+            !KeyboardPoll::original.InstallVirtual(keyboard, 2, KeyboardPoll::Thunk) ||
+            !TailUpdateHook<0x2C>::original.InstallVirtual(tree, 0x2C, TailUpdateHook<0x2C>::Thunk) ||
+            !TailUpdateHook<0x2D>::original.InstallVirtual(tree, 0x2D, TailUpdateHook<0x2D>::Thunk) ||
+            !TailUpdateHook<0x2E>::original.InstallVirtual(tree, 0x2E, TailUpdateHook<0x2E>::Thunk)) return false;
         devices->PrependEventSink(&inputSink);
         ready.store(true);
         SKSE::log::info("Full skeleton posing editor ready");
