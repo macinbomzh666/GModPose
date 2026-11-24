@@ -19,6 +19,7 @@
 #include "Breathing.h"
 #include "GrabButton.h"
 #include "SeatBlock.h"
+#include "TailPose.h"
 
 #include <atomic>
 #include <bit>
@@ -100,8 +101,8 @@ namespace GModPose::Runtime
         constexpr std::string_view kEye = "NPCEyeBone";
         constexpr std::array<std::string_view, 2> kClavicles{"NPC L Clavicle [LClv]", "NPC R Clavicle [RClv]"};
         constexpr std::array<std::string_view, 2> kToes{"NPC L Toe0 [LToe]", "NPC R Toe0 [RToe]"};
-        constexpr std::array<std::string_view, 5> kTail{"TailBone01", "TailBone02", "TailBone03", "TailBone04", "TailBone05"};
-        constexpr std::array kTailLabels{"Tail base", "Tail 2", "Tail 3", "Tail 4", "Tail tip"};
+        constexpr std::array<std::string_view, tailJointCount> kTail{"TailBone01", "TailBone02", "TailBone03", "TailBone04", "TailBone05"};
+        constexpr std::array kTailLabels{"Tail base", "Tail 2", "Tail 3", "Tail 4"};
         constexpr auto kSceneBoneIndex = std::numeric_limits<std::uint32_t>::max();
         struct ExtraHandle
         {
@@ -117,7 +118,7 @@ namespace GModPose::Runtime
             ExtraHandle{kToes[0], {}, "Left toes", {}},
             ExtraHandle{kToes[1], {}, "Right toes", {}},
         };
-        enum class HandleAction { Rotate, Torso, Bend, Endpoint, RotationOnly, Twist, Weapon };
+        enum class HandleAction { Rotate, Torso, Bend, Endpoint, Tail, RotationOnly, Twist, Weapon };
 
         bool IsTriangle(HandleAction action)
         {
@@ -268,6 +269,7 @@ namespace GModPose::Runtime
             std::size_t graphBoneCount{};
             RE::NiPointer<RE::BSFlattenedBoneTree> tailTree;
             std::array<RE::NiPointer<RE::NiAVObject>, kTail.size()> sceneTail;
+            std::vector<std::size_t> tailJoints;
             std::unordered_map<const RE::NiTransform*, std::size_t> byWorld;
             std::array<std::optional<Limb>, kLimbs.size()> limbs;
             std::array<Hand, 2> hands;
@@ -389,6 +391,13 @@ namespace GModPose::Runtime
                 struct Neck { std::size_t bone; Quaternion rotation; };
                 std::optional<Neck> neck{};
                 std::array<bool, kLimbs.size()> supportChecked{};
+                struct Tail
+                {
+                    std::array<Transform, tailJointCount> joints;
+                    std::array<Quaternion, tailJointCount> parentOffsets;
+                    std::size_t held;
+                };
+                std::optional<Tail> tail{};
             };
             std::optional<Grip> grip;
             std::optional<GripRotation> rotation;
@@ -1408,22 +1417,25 @@ namespace GModPose::Runtime
             SKSE::log::info("Tail posing: {} scene skeleton joints, equipped tail={}",
                 std::ranges::count_if(joints, [](auto joint) { return joint.has_value(); }), equippedTail);
 
-            const auto jointFrame = [&](std::size_t index) {
-                return joints[index] ? ReadTransform(next.bones[*joints[index]].ref.World()) : std::nullopt;
-            };
-            for (std::size_t i = 0; i < joints.size(); ++i) {
-                const auto frame = jointFrame(i);
-                if (!frame) continue;
-                const auto farther = i + 1 < joints.size() ? jointFrame(i + 1) : std::nullopt;
-                const auto nearer = !farther && i > 0 ? jointFrame(i - 1) : std::nullopt;
-                const Vec3 direction = farther ? farther->position - frame->position :
-                    nearer ? frame->position - nearer->position : Vec3{};
-                const auto lever = Length(direction) > .001 ?
-                    Rotate(Fingers::Conjugate(frame->rotation), direction * .5).value_or(Vec3{0, -4, 0}) :
-                    Vec3{0, -4, 0};
-                next.handles.push_back({*joints[i], HandleAction::Rotate,
-                    kTailLabels[i], 0, false, lever});
+            // The named joints must be on one branch. Rig helpers between them
+            // stay fixed relative to the preceding controlled joint.
+            for (const auto joint : joints) {
+                if (!joint) break;
+                if (!next.tailJoints.empty()) {
+                    const auto& preceding = next.bones[next.tailJoints.back()];
+                    const auto& current = next.bones[*joint];
+                    if (!IsAncestor(preceding.ref, current.ref.Parent())) {
+                        SKSE::log::warn("Tail posing: {} does not descend from {}", current.name, preceding.name);
+                        break;
+                    }
+                }
+                next.tailJoints.push_back(*joint);
             }
+            if (next.tailJoints.size() < 2) return;
+            for (std::size_t i = 0; i < next.tailJoints.size(); ++i)
+                next.handles.push_back({next.tailJoints[i], HandleAction::Tail,
+                    i + 1 == next.tailJoints.size() ? "Tail tip" : kTailLabels[i]});
+            SKSE::log::info("Tail posing: registered {} IK handles", next.tailJoints.size());
         }
 
         void CaptureReferenceControls(Capture& next)
@@ -1991,6 +2003,10 @@ namespace GModPose::Runtime
                         return (current->position + middle->position) * 0.5;
                 }
             }
+            if (handle.action == HandleAction::Tail && handle.bone == pose.tailJoints.front()) {
+                if (const auto next = worlds.Read(pose.bones[pose.tailJoints[1]].ref))
+                    return (current->position + next->position) * .5;
+            }
             if (handle.action == HandleAction::Rotate || handle.action == HandleAction::RotationOnly ||
                 handle.action == HandleAction::Weapon) {
                 const auto lever = Rotate(current->rotation, handle.lever);
@@ -2067,7 +2083,23 @@ namespace GModPose::Runtime
                 HoldDistance::Capture(camera.aim, camera.right, camera.up, point);
             if (!bone || !distance) return;
             Interaction::Grip grip{index, rotate, *distance, point, point, pose.translation, {}, *bone, {}, {}, {}, {}};
-            if (handle.action == HandleAction::Bend || handle.action == HandleAction::Endpoint) {
+            if (handle.action == HandleAction::Tail) {
+                Interaction::Grip::Tail tail{};
+                for (std::size_t i = 0; i < pose.tailJoints.size(); ++i) {
+                    const auto joint = pose.tailJoints[i];
+                    const auto ref = pose.bones[joint].ref;
+                    const auto world = worlds.Read(ref);
+                    if (!world) return;
+                    tail.joints[i] = *world;
+                    if (i > 0) {
+                        const auto parent = worlds.Read(ref.Parent());
+                        if (!parent) return;
+                        tail.parentOffsets[i] = Multiply(Fingers::Conjugate(tail.joints[i - 1].rotation), parent->rotation);
+                    }
+                    if (joint == handle.bone) tail.held = i;
+                }
+                grip.tail = tail;
+            } else if (handle.action == HandleAction::Bend || handle.action == HandleAction::Endpoint) {
                 const auto& limb = *pose.limbs[handle.limb];
                 const bool moveEndpoint = !rotate && handle.action == HandleAction::Endpoint;
                 if (moveEndpoint) {
@@ -2130,6 +2162,52 @@ namespace GModPose::Runtime
                 WriteRotation(bone.local, Multiply({-q.x, -q.y, -q.z, q.w}, rotation));
             } else return false;
             return true;
+        }
+
+        bool ApplyTailGrip(const Interaction::Grip::Tail& grip, Vec3 delta, std::optional<Quaternion> turn)
+        {
+            const auto tip = pose.tailJoints.size() - 1;
+            std::array<Quaternion, tailJointCount> world{};
+            for (std::size_t i = 0; i <= tip; ++i) world[i] = grip.joints[i].rotation;
+            bool limited = false;
+            if (turn) {
+                if (grip.held == tip) world[tip] = *turn;
+                else {
+                    const auto axis = Unit(grip.joints[grip.held + 1].position - grip.joints[grip.held].position);
+                    if (!axis) return true;
+                    // Roll around the outgoing link. Keeping all other world
+                    // frames fixed cancels the roll at the next joint.
+                    world[grip.held] = TailTwist(world[grip.held], *turn, *axis);
+                }
+            } else {
+                if (!grip.held && tip == 1) return true;
+                std::array<Vec3, tailJointCount> positions{};
+                for (std::size_t i = 0; i <= tip; ++i) positions[i] = grip.joints[i].position;
+                const auto held = std::max(grip.held, std::size_t{1});
+                const auto solution = MoveTail(std::span(positions).first(tip + 1), held,
+                    positions[held] + delta * (grip.held ? 1 : 2));
+                if (!solution) return true;
+                limited = solution->limited;
+                for (std::size_t i = 0; i < tip; ++i) {
+                    const auto swing = FromTo(positions[i + 1] - positions[i],
+                        solution->joints[i + 1] - solution->joints[i]);
+                    if (!swing) return true;
+                    world[i] = Multiply(*swing, world[i]);
+                }
+            }
+            WorldPose worlds;
+            const auto parent = worlds.Read(pose.bones[pose.tailJoints.front()].ref.Parent());
+            if (!parent) return true;
+            auto previous = parent->rotation;
+            for (std::size_t i = 0; i <= tip; ++i) {
+                // A tip drag preserves its authored bend relative to the preceding bone.
+                // Middle edits instead hold the tip's world orientation.
+                if (i == tip && !turn && grip.held == tip) break;
+                auto& bone = pose.bones[pose.tailJoints[i]];
+                WriteRotation(bone.local, TailLocalRotation(world[i], previous, grip.parentOffsets[i]));
+                previous = world[i];
+            }
+            return limited;
         }
 
         void ApplyEndpointSolution(Limb& limb, const EndpointGrip& grip, const EndpointSolution& solution,
@@ -2281,20 +2359,26 @@ namespace GModPose::Runtime
             }
             const bool bend = handle.action == HandleAction::Bend;
             const bool endpoint = handle.action == HandleAction::Endpoint;
+            const bool tail = grip.tail.has_value();
             const bool twist = handle.action == HandleAction::Twist;
             const bool weapon = handle.action == HandleAction::Weapon;
             const bool turning = grip.rotating;
             if (turning && !editor.rotation) {
                 WorldPose worlds;
                 const auto current = worlds.Read(pose.bones[handle.bone].ref);
-                const auto roll = twist ? TwistRollAxis(handle, worlds).value_or(camera.aim.direction) : camera.aim.direction;
+                auto roll = twist ? TwistRollAxis(handle, worlds).value_or(camera.aim.direction) : camera.aim.direction;
+                if (grip.tail && grip.tail->held + 1 < pose.tailJoints.size()) {
+                    const auto& chain = *grip.tail;
+                    roll = Unit(chain.joints[chain.held + 1].position - chain.joints[chain.held].position).value_or(roll);
+                }
                 if (current) editor.rotation = GripRotation::Begin(current->rotation, camera.right, camera.up, roll);
             }
             if (!turning) editor.rotation.reset();
             const auto priorRotation = editor.rotation ? editor.rotation->current : grip.bone.rotation;
             if (turning && editor.rotation)
                 grip.targetRotation = editor.rotation->Update(
-                    mouse[0], mouse[1], wheel, rotationScale, keyAngles, grip.viewForward, rotationDirections);
+                    mouse[0], mouse[1], wheel, rotationScale, keyAngles,
+                    tail ? editor.rotation->rollAxis : grip.viewForward, rotationDirections);
             grip.keyboardOffset = grip.keyboardOffset + travel;
             if (!turning) grip.distance.Nudge(wheel);
             // A latched nudge target stays in world space while the camera flies.
@@ -2304,9 +2388,12 @@ namespace GModPose::Runtime
             const bool turnEndpoint = endpoint && turning;
             const bool rotateInput = mouse[0] != 0 || mouse[1] != 0 || wheel != 0 || Length(keyAngles) > 0;
             const auto targetTravel = Length(target - grip.lastTarget);
-            bool changed = targetTravel > 0.001 || (turning && (!(endpoint || twist || weapon) || rotateInput));
+            bool changed = targetTravel > 0.001 || (turning && (!(endpoint || tail || twist || weapon) || rotateInput));
             if (changed) grip.lastTarget = target;
-            if (changed && grip.endpoint) {
+            if (changed && grip.tail) {
+                if (!turning || grip.targetRotation)
+                    frame.limited = ApplyTailGrip(*grip.tail, delta, grip.targetRotation);
+            } else if (changed && grip.endpoint) {
                 const auto& reference = *grip.endpoint;
                 const auto& model = reference.rig.leg ? ankleModel : wristModel;
                 const auto predictions = model.Predict(reference.rig, target);
