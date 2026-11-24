@@ -6,6 +6,7 @@
 #include "../src/core/PoseSerialization.h"
 #include "../src/core/PoseHistory.h"
 #include "../src/core/DragView.h"
+#include "../src/core/TailPose.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,56 @@ namespace
     }
     bool Near(double a, double b, double tolerance = 1e-7) { return std::abs(a - b) <= tolerance; }
     bool Near(Vec3 a, Vec3 b, double tolerance = 1e-7) { return Length(a - b) <= tolerance; }
+
+    void TailInverseKinematics()
+    {
+        const std::array<Vec3, tailJointCount> tail{{{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {2, 1, 0}, {3, 1, 0}}};
+        const auto preservesLinks = [&](const std::optional<TailMove>& move) {
+            if (!move || !Near(move->joints.front(), tail.front())) return false;
+            for (std::size_t i = 1; i < tail.size(); ++i)
+                if (!Near(Length(move->joints[i] - move->joints[i - 1]), 1)) return false;
+            return true;
+        };
+        // Drag the tip through the chain's interior and beyond its reach.
+        const Vec3 target{2, 1, 2};
+        const auto tip = MoveTail(tail, 4, target);
+        Check(preservesLinks(tip) && !tip->limited && Near(tip->joints.back(), target), "tail reaches tip target");
+        const auto extended = MoveTail(tail, 4, {10, 0, 0});
+        Check(preservesLinks(extended) && extended->limited && Near(extended->joints.back(), {4, 0, 0}),
+            "tail clamps tip reach without stretching");
+        Check(preservesLinks(MoveTail(tail, 4, {})), "tail can fold with coincident root and tip");
+
+        // A middle joint can travel around the pinned endpoints. Out-of-reach
+        // middle requests yield to both pins.
+        for (std::size_t held = 1; held < 4; ++held) {
+            const auto aim = *Rotate(AxisAngle(*Unit(tail.back()), .6), tail[held]);
+            const auto bend = MoveTail(tail, held, aim);
+            Check(preservesLinks(bend) && !bend->limited && Near(bend->joints[held], aim) &&
+                Near(bend->joints.back(), tail.back()), "tail bend holds tip and base");
+            const auto limited = MoveTail(tail, held, {20, 10, -3});
+            Check(preservesLinks(limited) && limited->limited && Near(limited->joints.back(), tail.back()),
+                "tail pins take priority over an unreachable middle target");
+        }
+
+        // Twist discards swing, so the next joint's position is unaffected.
+        const Vec3 shaft{1, 0, 0};
+        const auto roll = AxisAngle(shaft, .7);
+        const auto desired = Multiply(AxisAngle({0, 1, 0}, .5), roll);
+        const auto twist = TailTwist({}, desired, shaft);
+        Check(Near(*Rotate(twist, shaft), shaft) && Near(*Rotate(twist, {0, 0, 1}), *Rotate(roll, {0, 0, 1})),
+            "tail twist keeps the outgoing link aligned");
+
+        // XPMSSE inserts a CME node between controlled tail joints. Compose
+        // through its authored rotation when converting the fixed tip to local space.
+        const auto preceding = AxisAngle({0, 0, 1}, .7);
+        const auto helper = AxisAngle({0, 1, 0}, -.9);
+        const auto tipWorld = AxisAngle({1, 0, 0}, .4);
+        const auto local = TailLocalRotation(tipWorld, preceding, helper);
+        const auto reconstructed = Multiply(Multiply(preceding, helper), local);
+        Check(Near(*Rotate(tipWorld, {1, 0, 0}), *Rotate(reconstructed, {1, 0, 0})) &&
+            Near(*Rotate(tipWorld, {0, 1, 0}), *Rotate(reconstructed, {0, 1, 0})),
+            "tail rotation is written in the helper's parent frame");
+    }
     TwoBoneInput Arm()
     {
         return {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {1, 1, 0}, {0, 1, 1}, std::nullopt};
@@ -1572,6 +1623,7 @@ namespace
 
 int main()
 {
+    TailInverseKinematics();
     RotationAndSpace(); InverseKinematics(); NaturalLimbBends(); PlantedWristBend(); LimbCollisionClearance(); CoordinatedArmDrag(); AbsoluteWristSolve(); LearnedAnkleAndChestStance();
     ClavicleRecovery(); EndpointRotationIK(); WristTwist();
     HierarchyReconstruction(); TwistHierarchyReconstruction();
