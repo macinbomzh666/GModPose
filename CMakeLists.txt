@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(GModPose VERSION 1.2.0 LANGUAGES CXX)
+project(GModPose VERSION 1.2.1 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "GModPose requires Windows x64 and MSVC.")
