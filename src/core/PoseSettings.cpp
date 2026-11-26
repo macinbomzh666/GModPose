@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include <backends/imgui_impl_dx11.h>
 #include "PoseSettings.h"
+#include "DragView.h"
 #include "PresetStorage.h"
 #include "Editor.h"
 #include "../Version.h"
@@ -773,25 +774,25 @@ namespace GModPose::PoseSettings
         ImGui::DestroyContext(context);
     }
 
-    void DrawUI(ImGuiContext* context, bool settings, bool finger, bool face, bool body, float width, float height,
-        const char* hoverLabel, bool nudge, bool mirror)
+    void DrawUI(const DragView::Frame& view, float frameWidth, float frameHeight, float pulseStrength)
     {
-        if (!context) return;
-        ContextScope restore;
-        ImGui::SetCurrentContext(context);
         auto& io = ImGui::GetIO();
-        const auto reticleScale = std::clamp(height / 1080.0F, .75F, 2.0F);
-        const auto scale = std::min(width / 1440.0F, height / 1080.0F);
+        const auto reticleScale = std::clamp(frameHeight / 1080.0F, .75F, 2.0F);
+        const auto scale = std::min(frameWidth / 1440.0F, frameHeight / 1080.0F);
         ImGui::GetStyle().FontScaleMain = Get().uiScale / 100.0F;
         const auto previousSize = io.DisplaySize;
-        width /= scale;
-        height /= scale;
+        const float width = frameWidth / scale;
+        const float height = frameHeight / scale;
         io.DisplaySize = {width, height};
         io.DisplayFramebufferScale = {scale, scale};
         static auto last = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         io.DeltaTime = std::clamp(std::chrono::duration<float>(now - last).count(), 0.001F, 0.1F);
         last = now;
+        const bool settings = view.visible && view.settings;
+        const bool finger = view.visible && view.finger;
+        const bool face = view.visible && view.face;
+        const bool body = view.visible && view.body;
         io.MouseDrawCursor = settings || finger || face || body;
         if (io.MouseDrawCursor) {
             Pointer input;
@@ -862,12 +863,13 @@ namespace GModPose::PoseSettings
         }
         ImGui_ImplDX11_NewFrame();
         ImGui::NewFrame();
+        DragView::DrawOverlay(view, frameWidth, frameHeight, scale, pulseStrength);
         presetNameDrawnActive = false;
         if (finger) FingerPanel::Draw(width, height);
         else if (face) FacePanel::Draw(width, height);
         else if (body) BodyPanel(width, height);
         else if (settings) ControlsPanel(width, height);
-        else {
+        else if (view.visible) {
             Guide(width, height);
             const auto drawLabel = [&](const char* label, float offset) {
                 if (!label) return;
@@ -879,13 +881,14 @@ namespace GModPose::PoseSettings
                 draw->AddText(position, IM_COL32(233, 239, 241, 230), label);
                 ImGui::PopFont();
             };
+            const bool nudge = view.drawWorld && view.nudge;
+            const bool mirror = view.drawWorld && view.mirror;
             const char* mode = nudge ? (mirror ? "Nudge mode  /  Mirror mode" : "Nudge mode") :
                 mirror ? "Mirror mode" : nullptr;
             drawLabel(mode, -25 * reticleScale / scale - 16);
-            drawLabel(hoverLabel, 25 * reticleScale / scale);
+            drawLabel(view.drawWorld ? view.hoverLabel : nullptr, 25 * reticleScale / scale);
         }
         presetNameActive.store(presetNameDrawnActive);
         ImGui::Render();
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     }
 }

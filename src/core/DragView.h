@@ -117,6 +117,7 @@ namespace GModPose::DragView
 
     bool Install();
     bool Available();
+    void DrawOverlay(const Frame& view, float width, float height, float framebufferScale, float pulseStrength);
     const char* InputBlockReason();
     std::optional<Camera> ReadCamera();
     void Publish(Frame frame);

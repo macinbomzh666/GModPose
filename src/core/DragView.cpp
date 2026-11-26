@@ -3,10 +3,8 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
-#include <CommonStates.h>
-#include <Effects.h>
-#include <PrimitiveBatch.h>
-#include <VertexTypes.h>
+#include <imgui.h>
+#include <backends/imgui_impl_dx11.h>
 
 #include "DragView.h"
 #include "Editor.h"
@@ -26,59 +24,112 @@ namespace GModPose::DragView
         std::atomic_bool installed{false}, renderFailed{false};
 
         using Microsoft::WRL::ComPtr;
-        using DirectX::VertexPositionColor;
-
-        struct Renderer
+        template <class Shader, auto GetShader, auto SetShader>
+        struct SavedShader
         {
-            ID3D11Device* device;
-            ComPtr<ID3D11DeviceContext> deferred;
-            ComPtr<ID3D11InputLayout> layout;
-            DirectX::CommonStates states;
-            DirectX::BasicEffect effect;
-            std::unique_ptr<DirectX::PrimitiveBatch<VertexPositionColor>> batch;
+            ID3D11DeviceContext& context;
+            ComPtr<Shader> shader;
+            std::array<ID3D11ClassInstance*, D3D11_SHADER_MAX_INTERFACES> instances{};
+            UINT count = static_cast<UINT>(instances.size());
 
-            ImGuiContext* ui{};
-
-            explicit Renderer(ID3D11Device* source) : device(source), states(source), effect(source)
+            explicit SavedShader(ID3D11DeviceContext& immediate) : context(immediate)
             {
-                if (FAILED(device->CreateDeferredContext(0, deferred.GetAddressOf()))) return;
-                effect.SetVertexColorEnabled(true);
-                const void* bytecode{};
-                std::size_t bytes{};
-                effect.GetVertexShaderBytecode(&bytecode, &bytes);
-                if (FAILED(device->CreateInputLayout(VertexPositionColor::InputElements,
-                    VertexPositionColor::InputElementCount, bytecode, bytes, layout.GetAddressOf()))) return;
-                batch = std::make_unique<DirectX::PrimitiveBatch<VertexPositionColor>>(deferred.Get());
-                ui = PoseSettings::CreateUI(device, deferred.Get());
-                if (!ui) SKSE::log::warn("Could not initialize the posing settings and shortcut guide");
+                (context.*GetShader)(shader.GetAddressOf(), instances.data(), &count);
             }
 
-            ~Renderer() { PoseSettings::DestroyUI(ui); }
+            ~SavedShader()
+            {
+                (context.*SetShader)(shader.Get(), instances.data(), count);
+                for (auto* instance : instances)
+                    if (instance) instance->Release();
+            }
+        };
 
-            void Stroke(Vec3 from, Vec3 to, double width, const DirectX::XMFLOAT4& color)
+        struct OverlayPipeline
+        {
+            ID3D11DeviceContext& context;
+            std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+            ComPtr<ID3D11DepthStencilView> depth;
+            std::array<ID3D11UnorderedAccessView*, D3D11_1_UAV_SLOT_COUNT> uavs{};
+            UINT targetCount = 0;
+            UINT uavCount;
+            // The ImGui backend clears these stages without saving them.
+            SavedShader<ID3D11HullShader, &ID3D11DeviceContext::HSGetShader, &ID3D11DeviceContext::HSSetShader> hull;
+            SavedShader<ID3D11DomainShader, &ID3D11DeviceContext::DSGetShader, &ID3D11DeviceContext::DSSetShader> domain;
+            SavedShader<ID3D11ComputeShader, &ID3D11DeviceContext::CSGetShader, &ID3D11DeviceContext::CSSetShader> compute;
+
+            OverlayPipeline(ID3D11DeviceContext& immediate, D3D_FEATURE_LEVEL level) :
+                context(immediate),
+                uavCount(level >= D3D_FEATURE_LEVEL_11_1 ? D3D11_1_UAV_SLOT_COUNT :
+                    level >= D3D_FEATURE_LEVEL_11_0 ? D3D11_PS_CS_UAV_REGISTER_COUNT : 0),
+                hull(context), domain(context), compute(context)
+            {
+                context.OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), depth.GetAddressOf());
+                for (UINT i = 0; i < targets.size(); ++i)
+                    if (targets[i]) targetCount = i + 1;
+                if (targetCount < uavCount)
+                    context.OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr,
+                        targetCount, uavCount - targetCount, uavs.data() + targetCount);
+            }
+
+            ~OverlayPipeline()
+            {
+                if (std::ranges::any_of(uavs, [](auto* view) { return view != nullptr; })) {
+                    // Preserve the game's append and consume counters.
+                    context.OMSetRenderTargetsAndUnorderedAccessViews(targetCount, targets.data(), depth.Get(),
+                        targetCount, uavCount - targetCount, uavs.data() + targetCount, nullptr);
+                } else {
+                    context.OMSetRenderTargets(targetCount, targets.data(), depth.Get());
+                }
+                for (auto* target : targets)
+                    if (target) target->Release();
+                for (auto* uav : uavs)
+                    if (uav) uav->Release();
+            }
+        };
+
+        struct Color
+        {
+            float r, g, b, a;
+
+            ImU32 Packed() const { return ImGui::ColorConvertFloat4ToU32({r, g, b, a}); }
+        };
+
+        struct OverlayGeometry
+        {
+            ImDrawList& drawList;
+            const ImVec2 white = ImGui::GetFontTexUvWhitePixel();
+            const float framebufferScale;
+
+            ImVec2 Point(Vec3 p) const
+            {
+                return {static_cast<float>(p.x) / framebufferScale, static_cast<float>(p.y) / framebufferScale};
+            }
+
+            void Stroke(Vec3 from, Vec3 to, double width, Color color)
             {
                 const auto normal = Unit(Vec3{from.y - to.y, to.x - from.x, 0});
                 if (!normal) return;
                 const auto side = *normal * (width * 0.5);
-                const auto vertex = [&color](Vec3 p) {
-                    return VertexPositionColor{
-                        DirectX::XMFLOAT3{static_cast<float>(p.x), static_cast<float>(p.y), 0},
-                        color};
-                };
-                batch->DrawQuad(vertex(from + side), vertex(to + side), vertex(to - side), vertex(from - side));
+                drawList.PrimReserve(6, 4);
+                drawList.PrimQuadUV(Point(from + side), Point(to + side), Point(to - side), Point(from - side),
+                    white, white, white, white, color.Packed());
             }
 
-            void Disc(Vec3 center, double radius, Vec3 highlight, DirectX::XMFLOAT4 inner, DirectX::XMFLOAT4 rim)
+            void Disc(Vec3 center, double radius, Vec3 highlight, Color inner, Color rim)
             {
-                const auto vertex = [](Vec3 p, DirectX::XMFLOAT4 tint) {
-                    return VertexPositionColor{{static_cast<float>(p.x), static_cast<float>(p.y), 0}, tint};
-                };
-                const auto middle = vertex(center + highlight, inner);
-                auto previous = vertex(center + Vec3{radius, 0, 0}, rim);
-                for (int i = 1; i <= 36; ++i) {
-                    const double angle = 2 * std::numbers::pi * i / 36;
-                    const auto next = vertex(center + Vec3{radius * std::cos(angle), radius * std::sin(angle), 0}, rim);
-                    batch->DrawTriangle(middle, previous, next);
+                constexpr int segments = 36;
+                const auto middle = Point(center + highlight);
+                const auto innerColor = inner.Packed();
+                const auto rimColor = rim.Packed();
+                auto previous = Point(center + Vec3{radius, 0, 0});
+                drawList.PrimReserve(3 * segments, 3 * segments);
+                for (int i = 1; i <= segments; ++i) {
+                    const double angle = 2 * std::numbers::pi * i / segments;
+                    const auto next = Point(center + Vec3{radius * std::cos(angle), radius * std::sin(angle), 0});
+                    drawList.PrimVtx(middle, white, innerColor);
+                    drawList.PrimVtx(previous, white, rimColor);
+                    drawList.PrimVtx(next, white, rimColor);
                     previous = next;
                 }
             }
@@ -95,7 +146,7 @@ namespace GModPose::DragView
                     points[i] = from + delta * (double(i) / (points.size() - 1)) + *across * (jagged[i] * scale);
                 const auto forkEnd = points[5] + delta * .09 + *across * (19 * scale);
                 const auto forkKink = points[4] + delta * .07 + *across * (9 * scale);
-                const auto stroke = [&](double width, const DirectX::XMFLOAT4& color, bool branches) {
+                const auto stroke = [&](double width, Color color, bool branches) {
                     for (std::size_t i = 1; i < points.size(); ++i)
                         Stroke(points[i - 1], points[i], width * scale, color);
                     if (branches) {
@@ -104,55 +155,42 @@ namespace GModPose::DragView
                     }
                 };
 
-                batch->Begin();
                 stroke(10, {0.14F, 0.46F, 1.0F, strength * .24F}, false);
                 stroke(4.5, {0.34F, 0.74F, 1.0F, strength * .78F}, true);
                 stroke(1.65, {0.88F, 0.97F, 1.0F, strength}, true);
                 Disc(from, 14 * scale, {}, {0.37F, 0.75F, 1.0F, strength * .7F}, {0.17F, 0.40F, 1.0F, 0});
                 Disc(from, 4 * scale, {}, {0.94F, 1.0F, 1.0F, strength}, {0.43F, 0.77F, 1.0F, strength * .65F});
-                batch->End();
             }
 
-            bool Draw(const Frame& view, ID3D11DeviceContext* immediate, ID3D11RenderTargetView* target,
-                      float width, float height, float pulseStrength)
+            void Draw(const Frame& view, float width, float height, float pulseStrength)
             {
-                const D3D11_VIEWPORT viewport{0, 0, width, height, 0, 1};
-                deferred->RSSetViewports(1, &viewport);
-                deferred->RSSetState(states.CullNone());
-                deferred->OMSetRenderTargets(1, &target, nullptr);
-                deferred->OMSetDepthStencilState(states.DepthNone(), 0);
-                deferred->OMSetBlendState(states.NonPremultiplied(), nullptr, 0xFFFFFFFF);
-                effect.SetProjection(DirectX::XMMatrixOrthographicOffCenterRH(0, width, height, 0, 0, 1));
-                effect.Apply(deferred.Get());
-                deferred->IASetInputLayout(layout.Get());
                 const auto pixels = [width, height](Vec3 p) {
                     return Vec3{(1 + p.x) * width * 0.5, (1 - p.y) * height * 0.5, 0};
                 };
                 const double scale = std::clamp(height / 1080.0, 0.75, 2.0);
                 if (view.visible && view.drawWorld && !view.settings && !view.finger && !view.face && !view.body) {
-                    const auto glow = view.rotating ? DirectX::XMFLOAT4{1.0F, 0.53F, 0.12F, 0.30F} :
-                        DirectX::XMFLOAT4{0.2F, 0.65F, 1.0F, 0.25F};
-                    const auto beam = view.rotating ? DirectX::XMFLOAT4{1.0F, 0.78F, 0.30F, 0.95F} :
-                        DirectX::XMFLOAT4{0.69F, 0.94F, 1.0F, 0.93F};
-                    const auto drawCurve = [&](double strokeWidth, const DirectX::XMFLOAT4& color) {
+                    const auto glow = view.rotating ? Color{1.0F, 0.53F, 0.12F, 0.30F} :
+                        Color{0.2F, 0.65F, 1.0F, 0.25F};
+                    const auto beam = view.rotating ? Color{1.0F, 0.78F, 0.30F, 0.95F} :
+                        Color{0.69F, 0.94F, 1.0F, 0.93F};
+                    const auto drawCurve = [&](double strokeWidth, Color color) {
                         for (std::size_t i = 0; i < view.count; ++i)
                             Stroke(pixels(view.tether[i].start), pixels(view.tether[i].end), strokeWidth * scale, color);
                     };
-                    batch->Begin();
                     drawCurve(8, glow);
                     drawCurve(2.5, beam);
                     if (view.orb) {
                         const auto p = pixels(*view.orb);
-                        const auto shadow = view.rotating ? DirectX::XMFLOAT4{0.54F, 0.22F, 0.03F, 1} :
-                            DirectX::XMFLOAT4{0.025F, 0.23F, 0.47F, 1};
-                        Disc(p, 19 * scale, {}, beam, {glow.x, glow.y, glow.z, 0});
+                        const auto shadow = view.rotating ? Color{0.54F, 0.22F, 0.03F, 1} :
+                            Color{0.025F, 0.23F, 0.47F, 1};
+                        Disc(p, 19 * scale, {}, beam, {glow.r, glow.g, glow.b, 0});
                         Disc(p, 8.5 * scale, Vec3{-2.6, -3.0, 0} * scale, {1, 1, 1, 1}, shadow);
                         Disc(p + Vec3{-2.6, -3.0, 0} * scale, 2.2 * scale, {}, {1, 1, 1, 1}, beam);
                     }
-                    const DirectX::XMFLOAT4 outline{0.015F, 0.035F, 0.05F, 0.95F};
-                    const DirectX::XMFLOAT4 idle{0.94F, 0.98F, 1.0F, 1.0F};
-                    const DirectX::XMFLOAT4 hover{0.18F, 1.0F, 0.90F, 1.0F};
-                    const auto outlined = [&](Vec3 a, Vec3 b, const DirectX::XMFLOAT4& tint) {
+                    const Color outline{0.015F, 0.035F, 0.05F, 0.95F};
+                    const Color idle{0.94F, 0.98F, 1.0F, 1.0F};
+                    const Color hover{0.18F, 1.0F, 0.90F, 1.0F};
+                    const auto outlined = [&](Vec3 a, Vec3 b, Color tint) {
                         Stroke(a, b, 4.5 * scale, outline);
                         Stroke(a, b, 2.0 * scale, tint);
                     };
@@ -161,7 +199,7 @@ namespace GModPose::DragView
                     const auto marker = [&](std::size_t i, bool highlight) {
                         const auto p = pixels(*view.markers[i]);
                         const double r = (highlight ? 8 : 5) * scale;
-                        const auto color = highlight ? tint : DirectX::XMFLOAT4{0.48F, 0.8F, 1.0F, 0.95F};
+                        const auto color = highlight ? tint : Color{0.48F, 0.8F, 1.0F, 0.95F};
                         const auto bit = std::uint64_t{1} << i;
                         if (view.triangleHandles & bit) {
                             const auto top = p + Vec3{0, -r, 0};
@@ -205,20 +243,41 @@ namespace GModPose::DragView
                         for (const auto axis : {Vec3{1, 0, 0}, Vec3{-1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, -1, 0}})
                             outlined(center + axis * (9 * scale), center + axis * (18 * scale), tint);
                     }
-                    batch->End();
                 }
                 if (view.middlePulse && pulseStrength > 0) {
                     const auto& span = view.middlePulse->span;
                     DrawMiddlePulse(pixels(span.start), pixels(span.end), pulseStrength, scale);
                 }
-                if (view.visible) PoseSettings::DrawUI(ui, view.settings, view.finger, view.face, view.body, width, height,
-                    view.drawWorld ? view.hoverLabel : nullptr,
-                    view.drawWorld && view.nudge, view.drawWorld && view.mirror);
-                ComPtr<ID3D11CommandList> commands;
-                if (FAILED(deferred->FinishCommandList(FALSE, commands.GetAddressOf()))) return false;
-                // Preserve the renderer and other overlays' immediate-context state.
-                immediate->ExecuteCommandList(commands.Get(), TRUE);
-                return true;
+            }
+        };
+
+        struct Renderer
+        {
+            ID3D11Device* device;
+            ID3D11DeviceContext* context;
+            D3D_FEATURE_LEVEL featureLevel;
+            ImGuiContext* ui;
+
+            Renderer(ID3D11Device* device, ID3D11DeviceContext* context) :
+                device(device), context(context), featureLevel(device->GetFeatureLevel()),
+                ui(PoseSettings::CreateUI(device, context))
+            {}
+
+            ~Renderer() { PoseSettings::DestroyUI(ui); }
+
+            void Draw(const Frame& view, ID3D11RenderTargetView* target, float width, float height, float pulseStrength)
+            {
+                struct RestoreContext
+                {
+                    ImGuiContext* previous = ImGui::GetCurrentContext();
+                    ~RestoreContext() { ImGui::SetCurrentContext(previous); }
+                } restore;
+                ImGui::SetCurrentContext(ui);
+                PoseSettings::DrawUI(view, width, height, pulseStrength);
+
+                OverlayPipeline pipeline(*context, featureLevel);
+                context->OMSetRenderTargets(1, &target, nullptr);
+                ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
             }
         };
 
@@ -259,21 +318,18 @@ namespace GModPose::DragView
             if (!desc.Width || !desc.Height) return waiting("nonempty frame texture");
             pending = {};
             auto* device = reinterpret_cast<ID3D11Device*>(data.forwarder);
+            auto* context = reinterpret_cast<ID3D11DeviceContext*>(data.context);
             static std::unique_ptr<Renderer> renderer;
-            if (!renderer || renderer->device != device) {
-                renderer = std::make_unique<Renderer>(device);
-                if (!renderer->batch || !renderer->ui) {
+            if (!renderer || renderer->device != device || renderer->context != context) {
+                renderer = std::make_unique<Renderer>(device, context);
+                if (!renderer->ui) {
                     renderFailed.store(true);
                     SKSE::log::warn("Posing renderer unavailable: D3D11 or ImGui initialization failed");
                     return;
                 }
-                SKSE::log::info("Posing reticle renderer initialized ({}x{})", desc.Width, desc.Height);
+                SKSE::log::info("Posing overlay initialized on Skyrim's D3D11 context ({}x{})", desc.Width, desc.Height);
             }
-            if (!renderer->Draw(view, reinterpret_cast<ID3D11DeviceContext*>(data.context),
-                rtv, static_cast<float>(desc.Width), static_cast<float>(desc.Height), pulseStrength)) {
-                renderFailed.store(true);
-                SKSE::log::warn("Mouse tether unavailable: D3D11 command recording failed");
-            }
+            renderer->Draw(view, rtv, static_cast<float>(desc.Width), static_cast<float>(desc.Height), pulseStrength);
         }
 
         struct PresentHook
@@ -291,6 +347,12 @@ namespace GModPose::DragView
             }
             static inline HookOriginal<decltype(Thunk)> original;
         };
+    }
+
+    void DrawOverlay(const Frame& view, float width, float height, float framebufferScale, float pulseStrength)
+    {
+        OverlayGeometry geometry{.drawList = *ImGui::GetBackgroundDrawList(), .framebufferScale = framebufferScale};
+        geometry.Draw(view, width, height, pulseStrength);
     }
 
     bool Install()

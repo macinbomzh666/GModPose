@@ -11,6 +11,8 @@ struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ImGuiContext;
 
+namespace GModPose::DragView { struct Frame; }
+
 namespace GModPose::PoseSettings
 {
     enum class Action : std::size_t {
@@ -56,6 +58,5 @@ namespace GModPose::PoseSettings
 
     ImGuiContext* CreateUI(ID3D11Device* device, ID3D11DeviceContext* context);
     void DestroyUI(ImGuiContext* context);
-    void DrawUI(ImGuiContext* context, bool settings, bool finger, bool face, bool body, float width, float height,
-        const char* hoverLabel, bool nudge, bool mirror);
+    void DrawUI(const DragView::Frame& view, float frameWidth, float frameHeight, float pulseStrength);
 }
